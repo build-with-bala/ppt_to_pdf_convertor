@@ -1,8 +1,10 @@
 .venv/
 __pycache__/
-*.pdf
+*.pyc
 out/
+*.pdf
 *.aux
 *.log
 *.toc
 *.synctex.gz
+.gitignore
