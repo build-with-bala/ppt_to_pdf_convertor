@@ -1,0 +1,187 @@
+1) What you’ll use (tiny stack)
+
+Python 3.11+
+
+typer (CLI), pdf2image (slide images), pydantic (IR schema), jinja2 (stitch LaTeX)
+
+System: LibreOffice (to convert PPT/PPTX → PDF), poppler (for pdf2image)
+
+Your Gemini client (whatever you already use)
+
+pip install typer pdf2image pydantic jinja2
+# macOS brew:
+brew install --cask libreoffice
+brew install poppler
+
+2) Flow (three short steps)
+
+ingest
+.ppt/.pptx -> .pdf -> slide_N.png (DPI 300)
+
+extract
+For each slide_N.png → send to Gemini Vision → get LaTeX block (+ optional JSON IDs).
+(No fancy graph rebuild; if chart is hard → just use \includegraphics.)
+
+compose
+Inject all LaTeX blocks into a tiny template with \tableofcontents and hyperref. Compile once.
+
+3) CLI (one file, one command)
+python ppt2tex.py convert input.pptx --out out --dpi 300 --model gemini-1.5-pro
+
+
+Optional debug:
+
+python ppt2tex.py ingest input.pptx --out out
+python ppt2tex.py extract out/slides --out out/fragments
+python ppt2tex.py compose out/fragments --out out/document.tex
+
+4) Folders (simple)
+out/
+  slides/slide_0001.png
+  fragments/slide_0001.tex
+  document.tex
+  document.pdf
+
+5) Minimal LaTeX template (copy-paste)
+% out/template.tex
+\documentclass[11pt]{article}
+\usepackage{fontspec}
+\setmainfont{Times New Roman}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage[noabbrev]{cleveref}
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}
+\title{Auto Notes} \date{\today}
+\begin{document}
+\maketitle
+\tableofcontents
+% === SLIDE CONTENT START ===
+{{ content }}
+% === SLIDE CONTENT END ===
+\end{document}
+
+6) Vision prompt (short + strict)
+You are converting a lecture slide IMAGE to LaTeX.
+
+Return ONLY valid LaTeX that can be pasted inside a document body:
+- Use \section{} or \subsection{} if the slide has a clear title.
+- Inline math: $...$, display math: \[...\].
+- Figures: if needed, include:
+  \begin{figure}\centering
+  \includegraphics[width=\linewidth]{slides/slide_000N.png}
+  \caption{From slide N}
+  \label{fig:sN-1}
+  \end{figure}
+No explanations, no markdown, just LaTeX.
+
+
+Strong opinion: Don’t chase perfect charts in MVP. Keep it \includegraphics. Upgrade later.
+
+7) 100-line CLI skeleton (trimmed)
+# ppt2tex.py
+import subprocess, hashlib, json
+from pathlib import Path
+from typing import List
+import typer
+from pdf2image import convert_from_path
+from jinja2 import Template
+
+app = typer.Typer()
+
+def run(cmd: List[str]):
+    subprocess.run(cmd, check=True)
+
+def to_pdf(ppt: Path, outdir: Path) -> Path:
+    outdir.mkdir(parents=True, exist_ok=True)
+    run(["/Applications/LibreOffice.app/Contents/MacOS/soffice", "--headless",
+         "--convert-to", "pdf", "--outdir", str(outdir), str(ppt)])
+    return outdir / (ppt.stem + ".pdf")
+
+def pdf_to_pngs(pdf: Path, slides_dir: Path, dpi: int = 300):
+    slides_dir.mkdir(parents=True, exist_ok=True)
+    pages = convert_from_path(str(pdf), dpi=dpi)
+    paths = []
+    for i, p in enumerate(pages, start=1):
+        path = slides_dir / f"slide_{i:04d}.png"
+        p.save(path)
+        paths.append(path)
+    return paths
+
+def call_gemini(img_path: Path, model: str) -> str:
+    # TODO: plug your real Gemini call here. Return LaTeX string.
+    # For dev, return a placeholder to prove the pipe works.
+    return rf"\section*{{Slide {img_path.stem}}} Placeholder text."
+
+@app.command()
+def ingest(input_ppt: Path, out: Path = Path("out"), dpi: int = 300):
+    pdf = to_pdf(input_ppt, out)
+    pdf_to_pngs(pdf, out / "slides", dpi)
+    typer.echo("Ingest done.")
+
+@app.command()
+def extract(slides: Path = Path("out/slides"), out: Path = Path("out/fragments"),
+            model: str = "gemini-1.5-pro"):
+    out.mkdir(parents=True, exist_ok=True)
+    for img in sorted(slides.glob("slide_*.png")):
+        tex = call_gemini(img, model)
+        (out / f"{img.stem}.tex").write_text(tex)
+    typer.echo("Extract done.")
+
+@app.command()
+def compose(fragments: Path = Path("out/fragments"),
+           template: Path = Path("out/template.tex"),
+           out_tex: Path = Path("out/document.tex")):
+    if not template.exists():
+        # write tiny default template once
+        template.write_text(r"""\documentclass[11pt]{article}
+\usepackage{fontspec}\setmainfont{Times New Roman}
+\usepackage{amsmath,amssymb,graphicx,hyperref}
+\usepackage[noabbrev]{cleveref}
+\title{Auto Notes}\date{\today}\begin{document}\maketitle\tableofcontents
+{{ content }}
+\end{document}""")
+    content = "\n\n".join(
+        (fragments / f).read_text() for f in sorted(p.name for p in fragments.glob("*.tex"))
+    )
+    tpl = Template(template.read_text())
+    out_tex.parent.mkdir(parents=True, exist_ok=True)
+    out_tex.write_text(tpl.render(content=content))
+    typer.echo(f"Wrote {out_tex}. Compile with: xelatex {out_tex.name}")
+
+@app.command()
+def convert(input_ppt: Path, out: Path = Path("out"), dpi: int = 300,
+            model: str = "gemini-1.5-pro"):
+    ingest(input_ppt, out, dpi)          # ppt->pdf->png
+    extract(out / "slides", out / "fragments", model)  # png->latex
+    compose(out / "fragments", out / "template.tex", out / "document.tex")
+    # compile once (simple)
+    cwd = out
+    run(["xelatex", "document.tex"],) if cwd.exists() else None
+    typer.echo("Done.")
+
+if __name__ == "__main__":
+    app()
+
+
+You only replace call_gemini() with your actual API call. Everything else is glue.
+
+8) Guardrails (bare minimum)
+
+If Gemini returns bad LaTeX, wrap it with:
+
+strip markdown fences
+
+ensure balanced $ and \[ \] (simple regex checks)
+
+If a slide fails, write slide_xxxx.tex with a TODO block so the pipeline never blocks.
+
+9) What you’ll get (today)
+
+Clickable TOC (page 1) via hyperref
+
+Each slide becomes a section or subsection
+
+Images included when needed
+
+One-command flow: convert
